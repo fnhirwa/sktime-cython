@@ -1,10 +1,4 @@
-"""Tests for the Cython DTW distance.
-
-Shape / guard / internal-consistency tests are self-contained (no sktime) so
-they run in cibuildwheel's isolated wheel-test env, which installs only pytest.
-The equivalence-vs-numba test imports sktime lazily and is skipped where sktime
-is absent (install the ``dev`` extra to run it).
-"""
+"""Tests for the Cython DTW distance."""
 
 import importlib.util
 
@@ -104,3 +98,46 @@ def test_cython_matches_numba(d, kwargs):
     expected = numba_dtw(x, y, **kwargs)
     got = dtw_distance(x, y, **kwargs)
     np.testing.assert_allclose(got, expected, rtol=1e-9, atol=1e-9)
+
+
+def test_unbalanced_lengths():
+    """DTW between time series of significantly different lengths."""
+    x = _series(0, d=2, m=5)
+    y = _series(1, d=2, m=30)
+    cm = dtw_cost_matrix(x, y)
+    assert cm.shape == (5, 30)
+    assert dtw_distance(x, y) == pytest.approx(cm[-1, -1])
+
+
+def test_minimal_length():
+    """1-sample time series."""
+    x = np.array([[2.0]])
+    y = np.array([[5.0]])
+    assert dtw_distance(x, y) == pytest.approx(9.0)
+
+
+def test_non_c_contiguous_input():
+    """Handles non-C-contiguous arrays (Fortran-ordered or sliced)."""
+    x = np.asfortranarray(_series(0, m=20))
+    y = _series(1, m=40)[:, ::2]  # Strided slice
+    # Should complete without error or segfault
+    res = dtw_distance(x, y)
+    assert np.isfinite(res)
+
+
+def test_distance_and_cost_matrix_parity_with_window():
+    """Verify rolling buffer distance equals cost matrix corner WITH windowing."""
+    x, y = _series(10, m=30), _series(11, m=35)
+    kw = {"window": 0.15}
+    cm = dtw_cost_matrix(x, y, **kw)
+    dist = dtw_distance(x, y, **kw)
+    assert dist == pytest.approx(cm[-1, -1])
+
+
+def test_fully_masked_window_returns_inf():
+    """If the window masks out the path to (m1, m2), distance should be inf."""
+    x, y = _series(0, m=10), _series(1, m=10)
+    bm = np.full((10, 10), np.inf)
+    # Top-left cell valid, but no path to end
+    bm[0, 0] = 0.0
+    assert np.isinf(dtw_distance(x, y, bounding_matrix=bm))

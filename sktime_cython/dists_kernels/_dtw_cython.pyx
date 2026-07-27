@@ -1,4 +1,5 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """Cython dynamic time warping (DTW) kernels.
 
 Ahead-of-time compiled port of sktime's numba ``_cost_matrix`` kernel
@@ -16,11 +17,14 @@ numba implementation (verified against it as groundtruth in tests).
 
 The ``bounding_matrix`` follows sktime's sentinel convention: an in-bound
 cell holds a finite value (0.0) and an out-of-bound cell holds ``inf``.
-``libc.math.isfinite`` reproduces the numba ``np.isfinite`` gate exactly.
+To allow compilation with fast-math flags (e.g., ``-ffast-math`` / ``-O3``),
+the check is implemented via direct exponent bit-masking (``safe_isfinite``)
+rather than ``libc.math.isfinite``, avoiding compiler collapse of standard C
+library math macros.
 
-Note on compiler flags: this extension must NOT be built with ``-ffast-math``
-(``-ffinite-math-only``), which lets the compiler assume no ``inf``/``nan`` and
-would collapse the ``isfinite`` gate and the ``inf`` sentinels. See ``setup.py``.
+Note on compiler flags: while ``safe_isfinite`` handles fast-math compilation,
+ensure that sentinel comparisons involving ``INFINITY`` are validated in your
+build environment under ``-ffinite-math-only``.
 
 References
 ----------
@@ -32,18 +36,26 @@ Original DTW algorithm: Sakoe & Chiba, IEEE TASSP 26(1):43-49, 1978.
 import numpy as np
 
 cimport numpy as cnp
-from libc.math cimport INFINITY, isfinite
+from libc.math cimport INFINITY, fmin
 
 cnp.import_array()
 
 
+# Avoids strict-aliasing bugs by inspecting double bits as an integer
+cdef union Conv:
+    double d
+    unsigned long long u
+
+
 cdef inline double _min3(double a, double b, double c) noexcept nogil:
-    cdef double m = a
-    if b < m:
-        m = b
-    if c < m:
-        m = c
-    return m
+    return fmin(fmin(a, b), c)
+
+
+cdef inline bint safe_isfinite(double x) noexcept nogil:
+    cdef Conv conv
+    conv.d = x
+    # Standard IEEE 754 double: Exponent is bits 52..62 (11 bits)
+    return (conv.u & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL
 
 
 cdef inline double _local_cost(
@@ -88,7 +100,7 @@ def cost_matrix(
     with nogil:
         for i in range(m1):
             for j in range(m2):
-                if isfinite(bm[i, j]):
+                if safe_isfinite(bm[i, j]):
                     c[i + 1, j + 1] = _local_cost(xv, yv, i, j, d) + _min3(
                         c[i, j + 1], c[i + 1, j], c[i, j]
                     )
@@ -131,7 +143,7 @@ def distance(
         for i in range(m1):
             curr[0] = INFINITY
             for j in range(m2):
-                if isfinite(bm[i, j]):
+                if safe_isfinite(bm[i, j]):
                     curr[j + 1] = _local_cost(xv, yv, i, j, d) + _min3(
                         prev[j + 1], curr[j], prev[j]
                     )

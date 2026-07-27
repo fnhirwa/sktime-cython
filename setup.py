@@ -12,13 +12,6 @@ if sys.platform == "win32":
 else:
     _fast = ["-O3", "-ffast-math"]
 
-# DTW relies on inf sentinels and isfinite() for its bounding mask; -ffast-math
-# (-ffinite-math-only) assumes no inf/nan and would break both. Use plain -O3.
-if sys.platform == "win32":
-    _opt = ["/O2"]
-else:
-    _opt = ["-O3"]
-
 extensions = [
     Extension(
         "sktime_cython.transformations.rocket._minirocket_multivariate_cython",
@@ -34,7 +27,7 @@ extensions = [
         sources=["sktime_cython/dists_kernels/_dtw_cython.pyx"],
         include_dirs=[np.get_include()],
         define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
-        extra_compile_args=_opt,
+        extra_compile_args=_fast,
     ),
 ]
 
