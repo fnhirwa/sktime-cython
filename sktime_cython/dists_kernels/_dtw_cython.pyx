@@ -17,14 +17,6 @@ numba implementation (verified against it as groundtruth in tests).
 
 The ``bounding_matrix`` follows sktime's sentinel convention: an in-bound
 cell holds a finite value (0.0) and an out-of-bound cell holds ``inf``.
-To allow compilation with fast-math flags (e.g., ``-ffast-math`` / ``-O3``),
-the check is implemented via direct exponent bit-masking (``safe_isfinite``)
-rather than ``libc.math.isfinite``, avoiding compiler collapse of standard C
-library math macros.
-
-Note on compiler flags: while ``safe_isfinite`` handles fast-math compilation,
-ensure that sentinel comparisons involving ``INFINITY`` are validated in your
-build environment under ``-ffinite-math-only``.
 
 References
 ----------
@@ -37,25 +29,10 @@ import numpy as np
 
 cimport numpy as cnp
 from libc.math cimport INFINITY, fmin
-
 cnp.import_array()
-
-
-# Avoids strict-aliasing bugs by inspecting double bits as an integer
-cdef union Conv:
-    double d
-    unsigned long long u
-
 
 cdef inline double _min3(double a, double b, double c) noexcept nogil:
     return fmin(fmin(a, b), c)
-
-
-cdef inline bint safe_isfinite(double x) noexcept nogil:
-    cdef Conv conv
-    conv.d = x
-    # Standard IEEE 754 double: Exponent is bits 52..62 (11 bits)
-    return (conv.u & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL
 
 
 cdef inline double _local_cost(
@@ -88,6 +65,10 @@ def cost_matrix(
     cdef double[:, ::1] xv = x
     cdef double[:, ::1] yv = y
     cdef double[:, ::1] bm = bounding_matrix
+    cdef cnp.ndarray[cnp.uint8_t, ndim=2, mode="c"] bm_mask_arr = np.asarray(
+        np.isfinite(bounding_matrix), dtype=np.uint8
+    )
+    cdef unsigned char[:, ::1] bm_mask = bm_mask_arr
 
     # (m1 + 1, m2 + 1) padded with an inf border; [0, 0] = 0 seeds the path.
     cdef cnp.ndarray[cnp.float64_t, ndim=2, mode="c"] full = np.full(
@@ -100,7 +81,7 @@ def cost_matrix(
     with nogil:
         for i in range(m1):
             for j in range(m2):
-                if safe_isfinite(bm[i, j]):
+                if bm_mask[i, j]:
                     c[i + 1, j + 1] = _local_cost(xv, yv, i, j, d) + _min3(
                         c[i, j + 1], c[i + 1, j], c[i, j]
                     )
@@ -124,6 +105,10 @@ def distance(
     cdef double[:, ::1] xv = x
     cdef double[:, ::1] yv = y
     cdef double[:, ::1] bm = bounding_matrix
+    cdef cnp.ndarray[cnp.uint8_t, ndim=2, mode="c"] bm_mask_arr = np.asarray(
+        np.isfinite(bounding_matrix), dtype=np.uint8
+    )
+    cdef unsigned char[:, ::1] bm_mask = bm_mask_arr
 
     # prev = row i (padded), curr = row i + 1 (padded); length m2 + 1.
     cdef cnp.ndarray[cnp.float64_t, ndim=1, mode="c"] prev_a = np.full(
@@ -143,7 +128,7 @@ def distance(
         for i in range(m1):
             curr[0] = INFINITY
             for j in range(m2):
-                if safe_isfinite(bm[i, j]):
+                if bm_mask[i, j]:
                     curr[j + 1] = _local_cost(xv, yv, i, j, d) + _min3(
                         prev[j + 1], curr[j], prev[j]
                     )
