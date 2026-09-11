@@ -237,7 +237,6 @@ def test_kernel_validates_shapes_directly(kernel):
         func(x, y2, np.zeros((6, 4)))
 
 
-
 @pytest.mark.parametrize("m1,m2", UNEQUAL_LENGTHS)
 @pytest.mark.parametrize(
     "kwargs",
