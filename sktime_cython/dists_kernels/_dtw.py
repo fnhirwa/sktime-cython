@@ -4,7 +4,15 @@ Compute layer with no sktime dependency: numpy arrays in, scalar / numpy arrays
 out. The hot dynamic-programming recurrence lives in the compiled Cython kernel
 ``_dtw_cython``; everything here (input reshaping and Sakoe-Chiba / Itakura
 bounding-matrix construction) is pure numpy, ported from sktime so the bounding
-masks are bit-identical and the results match sktime's numba DTW exactly.
+masks are bit-identical and the results match sktime's numba DTW exactly, with
+one deliberate exception.
+
+That exception: the ported mask builders transpose their output into the
+``(m1, m2)`` layout the kernels index (see ``_to_xy_orientation``). numba's
+``lower_bounding`` does not, which is harmless for Sakoe-Chiba on equal-length
+series but mirrors the Itakura parallelogram and produces an out-of-bounds mask
+shape for unequal-length series. So ``itakura_max_slope`` results differ from
+numba's; every other mode stays bit-identical.
 
 Ports (BSD-3-Clause, authors chrisholder and TonyBagnall):
 * ``_to_timeseries`` <- ``sktime...._numba_utils.to_numba_timeseries``
@@ -50,6 +58,23 @@ def _to_timeseries(x):
     return np.ascontiguousarray(_x, dtype=np.float64)
 
 
+def _check_series_pair(x, y):
+    """Reshape both inputs and check they have the same number of channels.
+
+    The dependent local cost loops over ``x``'s channels and reads ``y[k, j]``
+    for each one with bounds checking disabled, so a mismatch would read past
+    the end of ``y``.
+    """
+    _x = _to_timeseries(x)
+    _y = _to_timeseries(y)
+    if _x.shape[0] != _y.shape[0]:
+        raise ValueError(
+            "The two time series must have the same number of channels, but "
+            f"x has {_x.shape[0]} and y has {_y.shape[0]}."
+        )
+    return _x, _y
+
+
 def _check_line_steps(line):
     """Clamp each step of a line to +/- 1 of the previous value."""
     prev = line[0]
@@ -64,7 +89,13 @@ def _check_line_steps(line):
 
 
 def _create_shape_on_matrix(bounding_matrix, y_upper_line, y_lower_line=None):
-    """Set the band between upper and lower lines to 0.0 (in-bound)."""
+    """Set the band between upper and lower lines to 0.0 (in-bound).
+
+    ``bounding_matrix`` is indexed ``[y_index, x_index]`` here, i.e. it must be
+    shaped ``(m2, m1)``: the lines are sampled once per ``x`` index (columns)
+    and give the ``y`` range (rows) reachable from it. Callers transpose the
+    result, since the kernels index the mask as ``bm[i_x, j_y]``.
+    """
     y_size = bounding_matrix.shape[0]
     if y_lower_line is None:
         y_lower_line = y_upper_line
@@ -83,18 +114,37 @@ def _create_shape_on_matrix(bounding_matrix, y_upper_line, y_lower_line=None):
     return bounding_matrix
 
 
+def _to_xy_orientation(mask):
+    """Transpose a ``[y, x]``-indexed mask into the kernels' ``(m1, m2)`` layout.
+
+    ``_create_shape_on_matrix`` writes ``mask[y_index, x_index]``, so the band it
+    builds is shaped ``(m2, m1)``. The kernels read ``bm[i, j]`` with ``i`` over
+    ``x`` and ``j`` over ``y``, so the mask has to be transposed on the way out.
+
+    sktime's numba ``lower_bounding`` skips this transpose, which is only
+    invisible for Sakoe-Chiba on equal-length series (that band is symmetric).
+    For the Itakura parallelogram it mirrors the band, and for unequal lengths
+    it yields a mask the DTW kernel indexes out of bounds. This port therefore
+    deliberately diverges from numba's ``itakura_parallelogram`` output.
+    """
+    return np.ascontiguousarray(mask.T)
+
+
 def _no_bounding(x, y):
     """All-zero (fully in-bound) mask of shape ``(m1, m2)``."""
     return np.zeros((x.shape[1], y.shape[1]))
 
 
 def _sakoe_chiba(x, y, window):
-    """Sakoe-Chiba band mask. ``window`` in [0, 1] is the fractional radius."""
+    """Sakoe-Chiba band mask of shape ``(m1, m2)``.
+
+    ``window`` in [0, 1] is the fractional radius.
+    """
     if window < 0 or window > 1:
         raise ValueError("Window must between 0 and 1")
     x_size = x.shape[1]
     y_size = y.shape[1]
-    bounding_matrix = np.full((x_size, y_size), np.inf)
+    bounding_matrix = np.full((y_size, x_size), np.inf)
     radius = ((x_size / 100) * window) * 100
 
     upper = np.interp(
@@ -107,11 +157,14 @@ def _sakoe_chiba(x, y, window):
         [0, x_size - 1],
         [0 + radius, y_size + radius - 1],
     )
-    return _create_shape_on_matrix(bounding_matrix, upper, lower)
+    return _to_xy_orientation(_create_shape_on_matrix(bounding_matrix, upper, lower))
 
 
 def _itakura_parallelogram(x, y, itakura_max_slope):
-    """Itakura parallelogram mask. ``itakura_max_slope`` in [0, 1]."""
+    """Itakura parallelogram mask of shape ``(m1, m2)``.
+
+    ``itakura_max_slope`` in [0, 1].
+    """
     if itakura_max_slope < 0 or itakura_max_slope > 1:
         raise ValueError("Window must between 0 and 1")
     x_size = x.shape[1]
@@ -141,15 +194,28 @@ def _itakura_parallelogram(x, y, itakura_max_slope):
     )
     if np.array_equal(upper, lower):
         upper = _check_line_steps(upper)
-    return _create_shape_on_matrix(bounding_matrix, upper, lower)
+    return _to_xy_orientation(_create_shape_on_matrix(bounding_matrix, upper, lower))
 
 
 def _resolve_bounding_matrix(
     x, y, window=None, itakura_max_slope=None, bounding_matrix=None
 ):
-    """Pick / build the bounding mask (finite = in-bound, inf = out-of-bound)."""
+    """Pick / build the bounding mask (finite = in-bound, inf = out-of-bound).
+
+    The returned mask is always ``(m1, m2)`` contiguous float64: the Cython
+    kernels read ``bm[i, j]`` for every ``i < m1``, ``j < m2`` with bounds
+    checking disabled, so any other shape is rejected here rather than read
+    out of bounds.
+    """
+    expected = (x.shape[1], y.shape[1])
     if bounding_matrix is not None:
-        return np.ascontiguousarray(bounding_matrix, dtype=np.float64)
+        bm = np.ascontiguousarray(bounding_matrix, dtype=np.float64)
+        if bm.shape != expected:
+            raise ValueError(
+                f"The bounding matrix must have shape {expected} "
+                f"(len(x), len(y)), but has shape {bm.shape}."
+            )
+        return bm
     if window is not None and itakura_max_slope is not None:
         raise ValueError(
             "You can only use one bounding matrix at once. You have set both "
@@ -179,18 +245,24 @@ def dtw_cost_matrix(x, y, window=None, itakura_max_slope=None, bounding_matrix=N
         Sakoe-Chiba band radius as a fraction in [0, 1].
     itakura_max_slope : float or None, default=None
         Itakura parallelogram max slope in [0, 1]. Mutually exclusive
-        with ``window``.
+        with ``window``. Results differ from sktime's numba DTW, whose
+        Itakura mask is transposed; see the module docstring.
     bounding_matrix : np.ndarray or None, default=None
         Custom ``(m1, m2)`` mask (finite = in-bound, inf = out-of-bound).
         Overrides ``window`` / ``itakura_max_slope`` when given.
+
+    Raises
+    ------
+    ValueError
+        If ``x`` and ``y`` have different channel counts, or if
+        ``bounding_matrix`` is given and is not ``(m1, m2)``.
 
     Returns
     -------
     np.ndarray, shape ``(m1, m2)``, float64
         Cost matrix; its bottom-right entry is the DTW distance.
     """
-    _x = _to_timeseries(x)
-    _y = _to_timeseries(y)
+    _x, _y = _check_series_pair(x, y)
     bm = _resolve_bounding_matrix(_x, _y, window, itakura_max_slope, bounding_matrix)
     return _cy.cost_matrix(_x, _y, bm)
 
@@ -206,10 +278,17 @@ def dtw_distance(x, y, window=None, itakura_max_slope=None, bounding_matrix=None
         Sakoe-Chiba band radius as a fraction in [0, 1].
     itakura_max_slope : float or None, default=None
         Itakura parallelogram max slope in [0, 1]. Mutually exclusive
-        with ``window``.
+        with ``window``. Results differ from sktime's numba DTW, whose
+        Itakura mask is transposed; see the module docstring.
     bounding_matrix : np.ndarray or None, default=None
         Custom ``(m1, m2)`` mask (finite = in-bound, inf = out-of-bound).
         Overrides ``window`` / ``itakura_max_slope`` when given.
+
+    Raises
+    ------
+    ValueError
+        If ``x`` and ``y`` have different channel counts, or if
+        ``bounding_matrix`` is given and is not ``(m1, m2)``.
 
     Returns
     -------
@@ -217,7 +296,6 @@ def dtw_distance(x, y, window=None, itakura_max_slope=None, bounding_matrix=None
         DTW distance between ``x`` and ``y``. Not square-rooted, matching
         sktime's convention (sum of squared local costs along the path).
     """
-    _x = _to_timeseries(x)
-    _y = _to_timeseries(y)
+    _x, _y = _check_series_pair(x, y)
     bm = _resolve_bounding_matrix(_x, _y, window, itakura_max_slope, bounding_matrix)
     return float(_cy.distance(_x, _y, bm))

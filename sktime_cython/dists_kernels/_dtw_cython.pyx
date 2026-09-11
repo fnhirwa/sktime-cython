@@ -1,5 +1,4 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
-# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """Cython dynamic time warping (DTW) kernels.
 
 Ahead-of-time compiled port of sktime's numba ``_cost_matrix`` kernel
@@ -17,6 +16,15 @@ numba implementation (verified against it as groundtruth in tests).
 
 The ``bounding_matrix`` follows sktime's sentinel convention: an in-bound
 cell holds a finite value (0.0) and an out-of-bound cell holds ``inf``.
+
+Both kernels index ``x``, ``y`` and the bounding matrix with bounds checking
+disabled, so both validate their argument shapes up front: ``x`` and ``y`` must
+share a channel count and the bounding matrix must be exactly ``(m1, m2)``.
+These checks run once per call, outside the ``nogil`` recurrence.
+
+The recurrence blocks cells with ``INFINITY`` and relies on ``inf`` propagating
+through ``+`` and ``fmin``, which is incompatible with finite-math assumptions;
+``setup.py`` therefore compiles this extension without ``-ffast-math``.
 
 References
 ----------
@@ -47,6 +55,30 @@ cdef inline double _local_cost(
     return s
 
 
+cdef _check_shapes(
+    cnp.ndarray x, cnp.ndarray y, cnp.ndarray bounding_matrix
+):
+    """Reject argument shapes the unchecked kernel loops would read past.
+
+    ``_local_cost`` walks ``x``'s channels and reads ``y[k, j]`` for each, and
+    the recurrence reads ``bounding_matrix[i, j]`` over the full ``(m1, m2)``
+    grid. Both do so with ``boundscheck=False``, so the shapes are checked here
+    instead. Callers in ``_dtw.py`` normally guarantee this; the check keeps the
+    kernels safe when they are called directly.
+    """
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(
+            "The two time series must have the same number of channels, but "
+            f"x has {x.shape[0]} and y has {y.shape[0]}."
+        )
+    if bounding_matrix.shape[0] != x.shape[1] or bounding_matrix.shape[1] != y.shape[1]:
+        raise ValueError(
+            f"The bounding matrix must have shape ({x.shape[1]}, {y.shape[1]}) "
+            f"(len(x), len(y)), but has shape "
+            f"({bounding_matrix.shape[0]}, {bounding_matrix.shape[1]})."
+        )
+
+
 def cost_matrix(
     cnp.ndarray[cnp.float64_t, ndim=2, mode="c"] x,
     cnp.ndarray[cnp.float64_t, ndim=2, mode="c"] y,
@@ -58,13 +90,19 @@ def cost_matrix(
     series (possibly different lengths). Returns the ``(m1, m2)`` cost matrix
     (the numba code's ``cost_matrix[1:, 1:]`` slice); the DTW distance is its
     bottom-right entry.
+
+    Raises
+    ------
+    ValueError
+        If ``x`` and ``y`` have different channel counts, or if
+        ``bounding_matrix`` is not ``(m1, m2)``.
     """
+    _check_shapes(x, y, bounding_matrix)
     cdef Py_ssize_t d = x.shape[0]
     cdef Py_ssize_t m1 = x.shape[1]
     cdef Py_ssize_t m2 = y.shape[1]
     cdef double[:, ::1] xv = x
     cdef double[:, ::1] yv = y
-    cdef double[:, ::1] bm = bounding_matrix
     cdef cnp.ndarray[cnp.uint8_t, ndim=2, mode="c"] bm_mask_arr = np.asarray(
         np.isfinite(bounding_matrix), dtype=np.uint8
     )
@@ -98,13 +136,19 @@ def distance(
 
     Numerically identical to ``cost_matrix(x, y, bm)[-1, -1]`` but uses
     ``O(m2)`` scratch instead of ``O(m1 * m2)``.
+
+    Raises
+    ------
+    ValueError
+        If ``x`` and ``y`` have different channel counts, or if
+        ``bounding_matrix`` is not ``(m1, m2)``.
     """
+    _check_shapes(x, y, bounding_matrix)
     cdef Py_ssize_t d = x.shape[0]
     cdef Py_ssize_t m1 = x.shape[1]
     cdef Py_ssize_t m2 = y.shape[1]
     cdef double[:, ::1] xv = x
     cdef double[:, ::1] yv = y
-    cdef double[:, ::1] bm = bounding_matrix
     cdef cnp.ndarray[cnp.uint8_t, ndim=2, mode="c"] bm_mask_arr = np.asarray(
         np.isfinite(bounding_matrix), dtype=np.uint8
     )
