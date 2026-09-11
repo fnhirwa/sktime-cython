@@ -197,11 +197,6 @@ def test_fully_masked_window_returns_inf():
     assert np.isinf(dtw_distance(x, y, bounding_matrix=bm))
 
 
-# ---------------------------------------------------------------------------
-# input validation: the kernels index x, y and the mask with boundscheck=False
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("func", [dtw_distance, dtw_cost_matrix])
 @pytest.mark.parametrize("dx,dy", [(2, 1), (1, 2), (3, 2)])
 def test_mismatched_channels_raises(func, dx, dy):
@@ -241,10 +236,6 @@ def test_kernel_validates_shapes_directly(kernel):
     with pytest.raises(ValueError, match="bounding matrix must have shape"):
         func(x, y2, np.zeros((6, 4)))
 
-
-# ---------------------------------------------------------------------------
-# bounding-matrix orientation: every builder must yield (m1, m2)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("m1,m2", UNEQUAL_LENGTHS)
@@ -291,11 +282,7 @@ def test_builders_are_x_by_y_oriented(m1, m2, builder, arg):
     assert np.isfinite(bm[-1, -1])
 
 
-# ---------------------------------------------------------------------------
 # equivalence against sktime's numba implementation (groundtruth)
-# ---------------------------------------------------------------------------
-
-
 @needs_sktime
 @pytest.mark.parametrize("d", [1, 3])
 @pytest.mark.parametrize("m", [10, 37, 50])
